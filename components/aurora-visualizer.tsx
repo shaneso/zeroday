@@ -4,15 +4,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   AlertCircle,
+  ArrowLeft,
+  ArrowRight,
   Circle,
   Code,
   Database,
+  Expand,
   ExternalLink,
   FileText,
   GitBranch,
   Globe,
   Layout,
   Lock,
+  Maximize,
+  Minimize,
   Monitor,
   Pause,
   Play,
@@ -20,7 +25,6 @@ import {
   Square,
   Wifi,
   Zap,
-  ArrowRight,
 } from "lucide-react";
 import {
   EDGES,
@@ -51,6 +55,10 @@ const ICONS: Record<string, React.ElementType> = {
 };
 
 const NODE_R = 18;
+const CONTENT_W = 1200;
+const CONTENT_H = 800;
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 2.5;
 
 type NodeStyle = {
   stroke: string;
@@ -148,6 +156,10 @@ function edgePath(x1: number, y1: number, x2: number, y2: number, type: Edge["ty
   return `M${x1} ${y1} Q${cx} ${cy} ${x2} ${y2}`;
 }
 
+function distBetween(a: { clientX: number; clientY: number }, b: { clientX: number; clientY: number }) {
+  return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+}
+
 interface AnimatedEdgeProps {
   edge: Edge;
   nodes: Record<string, Node>;
@@ -163,8 +175,6 @@ function AnimatedEdge({ edge, nodes, phase, breached }: AnimatedEdgeProps) {
 
   const ready = Boolean(from && to && edge.phase <= phase);
 
-  // Hooks must run unconditionally: guard the body with `ready` instead of
-  // returning early before useEffect.
   useEffect(() => {
     if (!ready) return;
     const el = ref.current;
@@ -211,9 +221,10 @@ interface NodeProps {
   onEnter: (id: string) => void;
   onLeave: () => void;
   breached: boolean;
+  onTap: (id: string) => void;
 }
 
-function AuroraNode({ node, phase, order, hovered, onEnter, onLeave, breached }: NodeProps) {
+function AuroraNode({ node, phase, order, hovered, onEnter, onLeave, breached, onTap }: NodeProps) {
   const active = phase >= node.appear;
   const isHovered = hovered === node.id;
   const style = TYPE_STYLE[node.type];
@@ -226,9 +237,14 @@ function AuroraNode({ node, phase, order, hovered, onEnter, onLeave, breached }:
   return (
     <motion.g
       key={node.id}
+      data-node={node.id}
       className="cursor-pointer"
       onMouseEnter={() => onEnter(node.id)}
       onMouseLeave={onLeave}
+      onTouchEnd={(e) => {
+        e.stopPropagation();
+        onTap(node.id);
+      }}
       initial={{ opacity: 0, scale: 0.8 }}
       animate={{
         opacity: active ? 1 : 0,
@@ -270,7 +286,6 @@ function AuroraNode({ node, phase, order, hovered, onEnter, onLeave, breached }:
       <g transform={`translate(${node.x - NODE_R + 7}, ${node.y - NODE_R + 7})`}>
         <Icon width={11} height={11} stroke={stroke} strokeWidth={1.6} fill="none" strokeLinecap="round" strokeLinejoin="round" />
       </g>
-      {/* Title sits above the circle so it stays readable */}
       <text
         x={node.x}
         y={node.y - NODE_R - 14}
@@ -307,86 +322,25 @@ interface TooltipState {
 
 export default function AuroraVisualizer() {
   const diagramWrapRef = useRef<HTMLDivElement>(null);
-  const containerRef = useRef<SVGSVGElement>(null);
   const [phase, setPhase] = useState(0);
   const [playing, setPlaying] = useState(true);
   const [tooltip, setTooltip] = useState<TooltipState>({ id: null, x: 0, y: 0 });
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Drag-to-pan state for the diagram
+  const [scale, setScale] = useState(1);
+  const scaleRef = useRef(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
-  const panStart = useRef<{
-    x: number;
-    y: number;
+  const [fullscreen, setFullscreen] = useState(false);
+  const panStart = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const touchStart = useRef<{
+    dist: number;
+    cx: number;
+    cy: number;
+    scale: number;
     panX: number;
     panY: number;
-    scale: number;
-    vw: number;
-    vh: number;
   } | null>(null);
 
-  const SLACK = 100; // viewBox units allowed off-screen when panning
-
-  const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
-
-  const getViewport = useCallback(() => {
-    const el = diagramWrapRef.current;
-    if (!el) return { scale: 1, vw: 1100, vh: 700 };
-    const r = el.getBoundingClientRect();
-    const scale = Math.min(r.width / 1100, r.height / 700);
-    return { scale, vw: r.width / scale, vh: r.height / scale };
-  }, []);
-
-  const panLimits = useCallback(() => {
-    const { vw, vh } = getViewport();
-    const minX = 80,
-      maxX = 990,
-      minY = 70,
-      maxY = 690;
-    return {
-      minPanX: -SLACK - minX,
-      maxPanX: vw + SLACK - maxX,
-      minPanY: -SLACK - minY,
-      maxPanY: vh + SLACK - maxY,
-    };
-  }, [getViewport]);
-
-  const onPanMove = useCallback(
-    (e: MouseEvent) => {
-      const start = panStart.current;
-      if (!start) return; // panStart.current is set synchronously in onPanStart
-      const dx = (e.clientX - start.x) / start.scale;
-      const dy = (e.clientY - start.y) / start.scale;
-      const { minPanX, maxPanX, minPanY, maxPanY } = panLimits();
-      setPan((p) => ({
-        x: clamp(start.panX + dx, minPanX, maxPanX),
-        y: clamp(start.panY + dy, minPanY, maxPanY),
-      }));
-    },
-    [panLimits]
-  );
-
-  const onPanEnd = useCallback(() => {
-    setIsPanning(false);
-    panStart.current = null;
-    window.removeEventListener("mousemove", onPanMove);
-    window.removeEventListener("mouseup", onPanEnd);
-  }, [onPanMove]);
-
-  const onPanStart = useCallback(
-    (e: React.MouseEvent) => {
-      // Only pan when dragging the background, not a node
-      if (e.target !== e.currentTarget) return;
-      if (e.button !== 0) return;
-      const { scale } = getViewport();
-      setIsPanning(true);
-      panStart.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y, scale, vw: 0, vh: 0 };
-      window.addEventListener("mousemove", onPanMove);
-      window.addEventListener("mouseup", onPanEnd);
-    },
-    [getViewport, pan.x, pan.y, onPanMove, onPanEnd]
-  );
+  scaleRef.current = scale;
 
   const breached = phase >= 8;
   const nodesInPhase = useMemo(() => NODES.filter((n) => n.appear <= phase), [phase]);
@@ -395,6 +349,133 @@ export default function AuroraVisualizer() {
   const currentPhase = PHASES[phase];
   const severityClass = SEVERITY_STYLE[currentPhase.severity];
 
+  const getViewport = useCallback(() => {
+    const el = diagramWrapRef.current;
+    if (!el) return { cssScale: 1, vw: CONTENT_W, vh: CONTENT_H, offX: 0, offY: 0, w: CONTENT_W, h: CONTENT_H };
+    const r = el.getBoundingClientRect();
+    const cssScale = Math.min(r.width / CONTENT_W, r.height / CONTENT_H);
+    return {
+      cssScale,
+      vw: r.width / cssScale,
+      vh: r.height / cssScale,
+      offX: (r.width - CONTENT_W * cssScale) / 2,
+      offY: (r.height - CONTENT_H * cssScale) / 2,
+      w: r.width,
+      h: r.height,
+    };
+  }, []);
+
+  const clampPan = useCallback(
+    (p: { x: number; y: number }) => {
+      const { vw: vwView, vh: vhView } = getViewport();
+      return {
+        x: Math.min(Math.max(p.x, -CONTENT_W - 200), vwView + 200),
+        y: Math.min(Math.max(p.y, -CONTENT_H - 200), vhView + 200),
+      };
+    },
+    [getViewport]
+  );
+
+  // ---- Zoom helpers ----
+  const zoomAround = useCallback(
+    (clientX: number, clientY: number, newScale: number) => {
+      const oldScale = scaleRef.current;
+      if (Math.abs(newScale - oldScale) < 0.001) return;
+      const el = diagramWrapRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const { cssScale, offX, offY } = getViewport();
+      const cursorContentX = (clientX - rect.left - offX) / cssScale;
+      const cursorContentY = (clientY - rect.top - offY) / cssScale;
+      const ratio = 1 - newScale / oldScale;
+      setPan(clampPan({ x: pan.x + (cursorContentX - pan.x) * ratio, y: pan.y + (cursorContentY - pan.y) * ratio }));
+      setScale(newScale);
+    },
+    [pan.x, pan.y, getViewport, clampPan]
+  );
+
+  const setZoom = useCallback((next: number) => {
+    setScale((s) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next)));
+  }, []);
+
+  const resetView = useCallback(() => {
+    setScale(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
+  // ---- Wheel zoom (desktop) ----
+  const onWheel = useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      const newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, scaleRef.current * (1 - e.deltaY * 0.001)));
+      zoomAround(e.clientX, e.clientY, newScale);
+    },
+    [zoomAround]
+  );
+
+  // ---- Fullscreen ----
+  const toggleFullscreen = useCallback(() => {
+    const el = diagramWrapRef.current;
+    if (!el) return;
+    if (!document.fullscreenElement) {
+      el.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen();
+    }
+  }, []);
+
+  useEffect(() => {
+    const onFullscreenChange = () => setFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
+
+  // ---- Touch (mobile pinch + drag) ----
+  const onTouchStart = useCallback(
+    (e: React.TouchEvent) => {
+      if ((e.target as Element)?.closest("[data-node]")) return; // let the node handle taps
+      if (e.touches.length === 1) {
+        const t = e.touches[0];
+        setIsPanning(true);
+        panStart.current = { x: t.clientX, y: t.clientY, panX: pan.x, panY: pan.y };
+      } else if (e.touches.length === 2) {
+        setIsPanning(false);
+        const d = distBetween(e.touches[0], e.touches[1]);
+        const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        touchStart.current = { dist: d, cx, cy, scale: scaleRef.current, panX: pan.x, panY: pan.y };
+      }
+    },
+    [pan.x, pan.y]
+  );
+
+  const onTouchMove = useCallback(
+    (e: React.TouchEvent) => {
+      e.preventDefault();
+      const { cssScale } = getViewport();
+      if (e.touches.length === 1 && panStart.current) {
+        const t = e.touches[0];
+        const start = panStart.current;
+        const dx = (t.clientX - start.x) / (scaleRef.current * cssScale);
+        const dy = (t.clientY - start.y) / (scaleRef.current * cssScale);
+        setPan(clampPan({ x: start.panX + dx, y: start.panY + dy }));
+      } else if (e.touches.length === 2 && touchStart.current) {
+        const d = distBetween(e.touches[0], e.touches[1]);
+        const start = touchStart.current;
+        const newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, start.scale * (d / start.dist)));
+        zoomAround(start.cx, start.cy, newScale);
+        touchStart.current = { ...start, scale: newScale };
+      }
+    },
+    [getViewport, zoomAround, clampPan]
+  );
+
+  const onTouchEnd = useCallback(() => {
+    setIsPanning(false);
+    panStart.current = null;
+    touchStart.current = null;
+  }, []);
+
   const showTooltip = useCallback(
     (id: string) => {
       const node = NODES.find((n) => n.id === id);
@@ -402,30 +483,27 @@ export default function AuroraVisualizer() {
         setTooltip({ id: null, x: 0, y: 0 });
         return;
       }
+      const { cssScale, offX, offY, w, h } = getViewport();
       const rect = diagramWrapRef.current.getBoundingClientRect();
-      const { scale } = getViewport();
-      const offsetX = (rect.width - 1100 * scale) / 2;
-      const offsetY = (rect.height - 700 * scale) / 2;
-      const sx = offsetX + (node.x + pan.x) * scale;
-      const sy = offsetY + (node.y + pan.y) * scale;
-      setTooltip({ id, x: sx, y: sy });
+      const sx = rect.left + offX + (node.x + pan.x) * scale * cssScale;
+      const sy = rect.top + offY + (node.y + pan.y) * scale * cssScale;
+      // Place the preview above the node, clamped inside the map wrapper.
+      let x = sx - 135; // centered on node (max-w 270 => half ~135)
+      let y = sy - NODE_R * scale * cssScale - 150; // above the circle
+      x = Math.min(Math.max(x, rect.left + 10), rect.left + w - 280);
+      y = Math.min(Math.max(y, rect.top + 10), rect.top + h - 130);
+      setTooltip({ id, x, y });
     },
-    [pan.x, pan.y, getViewport],
+    [pan.x, pan.y, scale, getViewport]
   );
 
+  // Autoplay ticker
   useEffect(() => {
-    if (!playing) {
-      intervalRef.current && clearInterval(intervalRef.current);
-      intervalRef.current = null;
-      return;
-    }
-    intervalRef.current = setInterval(() => {
+    if (!playing) return;
+    const id = setInterval(() => {
       setPhase((p) => (p >= PHASE_COUNT - 1 ? PHASE_COUNT - 1 : p + 1));
     }, 2600);
-    return () => {
-      intervalRef.current && clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    };
+    return () => clearInterval(id);
   }, [playing]);
 
   useEffect(() => {
@@ -436,15 +514,21 @@ export default function AuroraVisualizer() {
         e.preventDefault();
         setPlaying((p) => !p);
       }
+      if (e.key === "=" || e.key === "+") setZoom(Math.min(ZOOM_MAX, scaleRef.current + 0.2));
+      if (e.key === "-") setZoom(Math.max(ZOOM_MIN, scaleRef.current - 0.2));
+      if (e.key === "0") resetView();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [setZoom, resetView]);
 
   const goTo = (p: number) => {
     setPhase(Math.max(0, Math.min(PHASE_COUNT - 1, p)));
     setPlaying(false);
   };
+
+  const previousPhase = () => setPhase((p) => Math.max(0, p - 1));
+  const nextPhase = () => setPhase((p) => Math.min(PHASE_COUNT - 1, p + 1));
 
   const nodeContent: Record<string, { title: string; detail: string }> = {
     attacker: {
@@ -509,6 +593,9 @@ export default function AuroraVisualizer() {
     },
   };
 
+  const { cssScale } = getViewport();
+  const transform = `translate(${pan.x * cssScale}px, ${pan.y * cssScale}px) scale(${scale})`;
+
   return (
     <div className="relative w-full max-w-7xl mx-auto px-4 py-6">
       {/* Header */}
@@ -534,14 +621,18 @@ export default function AuroraVisualizer() {
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Diagram column */}
-        <div className="lg:col-span-7 flex flex-col min-h-[560px]">
+        <div className="lg:col-span-7 flex flex-col min-h-[720px] lg:min-h-[900px]">
           <div
             ref={diagramWrapRef}
             className="flex-1 relative rounded-xl border border-slate-800 bg-slate-950/60 shadow-2xl overflow-hidden group ring-1 ring-slate-800/50 backdrop-blur-sm"
+            onWheel={onWheel}
+            onTouchStart={onTouchStart}
+            onTouchMove={onTouchMove}
+            onTouchEnd={onTouchEnd}
+            style={{ touchAction: "none" }}
           >
             <svg
-              ref={containerRef}
-              viewBox="0 0 1100 700"
+              viewBox={`0 0 ${CONTENT_W} ${CONTENT_H}`}
               className="w-full h-full block"
               preserveAspectRatio="xMidYMid meet"
               role="img"
@@ -566,35 +657,45 @@ export default function AuroraVisualizer() {
                 </marker>
               </defs>
 
-              {/* Pan background: captures drag gestures to move the diagram.
-                   Sits behind everything so node clicks pass through to nodes. */}
+              {/* Pan background: captures drag gestures to move the diagram */}
               <rect
-                width="1100"
-                height="700"
+                width={CONTENT_W}
+                height={CONTENT_H}
                 fill="none"
                 pointerEvents="all"
                 cursor={isPanning ? "grabbing" : "grab"}
-                onMouseDown={onPanStart}
+                onMouseDown={(e: React.MouseEvent) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.button !== 0) return;
+                  const { cssScale } = getViewport();
+                  setIsPanning(true);
+                  panStart.current = {
+                    x: e.clientX,
+                    y: e.clientY,
+                    panX: pan.x,
+                    panY: pan.y,
+                  };
+                  window.addEventListener("mousemove", onPanMove);
+                  window.addEventListener("mouseup", onPanEnd);
+                }}
               />
 
               {/* Background grid */}
               <g stroke="rgb(255 255 255 / 0.04)" strokeWidth="1">
-                {[0, 275, 550, 825].map((x) => (
-                  <line key={x} x1={x} y1={0} x2={x} y2={700} />
+                {[0, 300, 600, 900, 1200].map((x) => (
+                  <line key={x} x1={x} y1={0} x2={x} y2={CONTENT_H} />
                 ))}
-                {[0, 175, 350, 525].map((y) => (
-                  <line key={y} x1={0} y1={y} x2={1100} y2={y} />
+                {[0, 200, 400, 600].map((y) => (
+                  <line key={y} x1={0} y1={y} x2={CONTENT_W} y2={y} />
                 ))}
               </g>
 
-              {/* Pannable content group */}
-              <g transform={`translate(${pan.x} ${pan.y})`}>
+              {/* Pannable + zoomable content group (CSS transform) */}
+              <g style={{ transform, transformOrigin: "0 0" }}>
                 {/* Edges drawn behind nodes */}
                 {edgesInPhase.map((edge) => (
                   <AnimatedEdge key={edge.id} edge={edge} nodes={nodesById} phase={phase} breached={breached} />
                 ))}
-
-                {/* Nodes */}
                 <AnimatePresence>
                   {nodesInPhase.map((node, order) => (
                     <AuroraNode
@@ -606,23 +707,28 @@ export default function AuroraVisualizer() {
                       onEnter={showTooltip}
                       onLeave={() => setTooltip({ id: null, x: 0, y: 0 })}
                       breached={breached}
+                      onTap={showTooltip}
                     />
                   ))}
                 </AnimatePresence>
               </g>
             </svg>
 
-            {/* Tooltip overlay */}
+            {/* Tooltip overlay (inside the map scope) */}
             {tooltip.id && (
               <div
-                className="absolute pointer-events-none z-50 translate-x-1/2 -translate-y-full mb-3"
-                style={{ left: tooltip.x, top: tooltip.y }}
+                className="absolute pointer-events-none z-50"
+                style={{
+                  left: tooltip.x,
+                  top: tooltip.y,
+                  transform: `translateX(-50%)`,
+                }}
               >
                 <motion.div
                   initial={{ opacity: 0, y: 6 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: 6 }}
-                  className="max-w-[270px] rounded-lg border border-slate-700 bg-slate-900/90 p-3 shadow-2xl backdrop-blur-md text-left border-l-4 border-l-amber-500"
+                  className="max-w-[270px] rounded-lg border border-slate-700 bg-slate-900/95 p-3 shadow-2xl backdrop-blur-md text-left border-l-4 border-l-amber-500"
                 >
                   <div className="flex items-center gap-2 mb-1">
                     <div className="w-2 h-2 rounded-full bg-amber-500"></div>
@@ -642,10 +748,42 @@ export default function AuroraVisualizer() {
               </span>
               <span className="text-xs font-semibold text-slate-200">{currentPhase.title}</span>
             </div>
+
+            {/* Zoom hint badge */}
+            <div className="absolute top-6 right-6 z-10 flex flex-col gap-1 pointer-events-none">
+              <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">view</span>
+              <span className="text-xs font-semibold text-slate-200">{Math.round(scale * 100)}%</span>
+            </div>
           </div>
 
           {/* Stepper */}
           <div className="mt-6 flex items-center justify-between">
+            {/* Back / Forward timespan navigation */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={previousPhase}
+                disabled={phase === 0}
+                className={`p-2 rounded hover:bg-slate-800 transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                  phase === 0 ? "text-slate-600" : "text-slate-300"
+                }`}
+                aria-label="Previous moment"
+                title="Previous moment"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+              <button
+                onClick={nextPhase}
+                disabled={phase === PHASE_COUNT - 1}
+                className={`p-2 rounded hover:bg-slate-800 transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${
+                  phase === PHASE_COUNT - 1 ? "text-slate-600" : "text-slate-300"
+                }`}
+                aria-label="Next moment"
+                title="Next moment"
+              >
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            </div>
+
             <div className="flex -space-x-2">
               {[...Array(PHASE_COUNT)].map((_, i) => (
                 <button
@@ -670,16 +808,24 @@ export default function AuroraVisualizer() {
                 {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
               </button>
               <button
-                onClick={() => setPan({ x: 0, y: 0 })}
+                onClick={toggleFullscreen}
+                className="p-1.5 hover:bg-slate-800 rounded transition-colors"
+                aria-label={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+                title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+              >
+                {fullscreen ? <Minimize className="w-3 h-3" /> : <Maximize className="w-3 h-3" />}
+              </button>
+              <button
+                onClick={resetView}
                 className="p-1.5 hover:bg-slate-800 rounded transition-colors"
                 aria-label="Reset view"
-                title="Reset view"
+                title="Reset view (0)"
               >
-                <ArrowRight className="w-3 h-3 rotate-180" />
+                <Expand className="w-3 h-3" />
               </button>
               <span>{playing ? "auto-play on" : "paused"}</span>
               <span className="text-slate-600">·</span>
-              <span>← → to step</span>
+              <span>← → to step  ·  +/- to zoom  ·  drag to pan</span>
             </div>
           </div>
         </div>
@@ -730,7 +876,7 @@ export default function AuroraVisualizer() {
             <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider mb-3">
               Node inspector
             </h2>
-            <p className="text-xs text-slate-500 mb-3">Hover any node in the diagram to inspect it.</p>
+            <p className="text-xs text-slate-500 mb-3">Tap or hover any node in the map to inspect it.</p>
             {tooltip.id ? (
               <>
                 <h3 className="text-xs font-bold text-slate-200 mb-1 capitalize">{tooltip.id}</h3>
@@ -755,4 +901,20 @@ export default function AuroraVisualizer() {
       </footer>
     </div>
   );
+
+  /* ---- Desktop pan mouse move/end (window listeners) ---- */
+  function onPanMove(e: MouseEvent) {
+    const start = panStart.current;
+    if (!start) return;
+    const { cssScale } = getViewport();
+    const dx = (e.clientX - start.x) / (scaleRef.current * cssScale);
+    const dy = (e.clientY - start.y) / (scaleRef.current * cssScale);
+    setPan(clampPan({ x: start.panX + dx, y: start.panY + dy }));
+  }
+  function onPanEnd() {
+    setIsPanning(false);
+    panStart.current = null;
+    window.removeEventListener("mousemove", onPanMove);
+    window.removeEventListener("mouseup", onPanEnd);
+  }
 }
