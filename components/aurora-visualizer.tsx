@@ -414,25 +414,49 @@ export default function AuroraVisualizer() {
     [zoomAround]
   );
 
-  // ---- Fullscreen ----
+  // ---- Fullscreen (browser API + CSS fallback for mobile) ----
+  const supportsFullscreen =
+    typeof document !== "undefined" &&
+    (document.documentElement.requestFullscreen ||
+      (document.documentElement as any).webkitRequestFullscreen);
+
   const toggleFullscreen = useCallback(() => {
     const el = diagramWrapRef.current;
     if (!el) return;
-    if (!document.fullscreenElement) {
-      el.requestFullscreen().catch(() => {
-        // Mobile browsers often block fullscreen; fall back to expanding in place.
+    if (!document.fullscreenElement && supportsFullscreen) {
+      const req =
+        el.requestFullscreen || ((el as any).webkitRequestFullscreen && (el as any).webkitRequestFullscreen.bind(el));
+      req().catch(() => {
+        // Mobile browsers (iOS Safari, etc.) block fullscreen → fall back to CSS fullscreen.
         setFullscreen(true);
       });
-    } else {
+    } else if (document.fullscreenElement) {
       document.exitFullscreen();
+    } else {
+      // No API support at all (typical mobile) → CSS fullscreen fallback.
+      setFullscreen(true);
     }
-  }, []);
+  }, [supportsFullscreen]);
 
   useEffect(() => {
-    const onFullscreenChange = () => setFullscreen(!!document.fullscreenElement);
+    const onFullscreenChange = () => {
+      const fs = !!document.fullscreenElement;
+      setFullscreen(fs);
+      if (!fs) scaleRef.current = scale; // keep scale in sync when exiting
+    };
     document.addEventListener("fullscreenchange", onFullscreenChange);
-    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
-  }, []);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && (fullscreen || document.fullscreenElement)) {
+        if (document.exitFullscreen) document.exitFullscreen();
+        setFullscreen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [fullscreen, scale]);
 
   // ---- Touch (mobile pinch + drag) ----
   const onTouchStart = useCallback(
@@ -606,28 +630,48 @@ export default function AuroraVisualizer() {
   // Single transform source of truth: SVG attribute (works on mobile WebKit).
   const transform = `translate(${pan.x} ${pan.y}) scale(${scale})`;
 
+  // CSS fullscreen fallback only applies when we're NOT in real browser fullscreen
+  // (real fullscreen is handled by the browser itself).
+  const cssFullscreen = fullscreen && !document.fullscreenElement;
+  const wrapStyle: React.CSSProperties | undefined = cssFullscreen
+    ? {
+        position: "fixed",
+        inset: 0,
+        zIndex: 50,
+        width: "100vw",
+        height: "100vh",
+        maxWidth: "none",
+        background: "#0a0c12",
+        border: "none",
+        borderRadius: 0,
+        boxShadow: "none",
+      }
+    : undefined;
+
   return (
     <div className="relative w-full max-w-7xl mx-auto px-4 py-6">
-      {/* Header */}
-      <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-2 text-xs font-mono text-amber-400/70 tracking-wider uppercase">
-            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
-            OPERATION AURORA — VISUALIZER
+      {/* Header - hidden when in CSS fullscreen fallback */}
+      {!fullscreen && (
+        <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2 text-xs font-mono text-amber-400/70 tracking-wider uppercase">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+              OPERATION AURORA — VISUALIZER
+            </div>
+            <h1 className="text-2xl md:text-3xl font-semibold text-slate-100 tracking-tight">
+              CVE-2010-0249<span className="text-slate-500"> · IE DOM Use-After-Free</span>
+            </h1>
+            <p className="text-sm text-slate-400 max-w-md">
+              Animated, interactive reconstruction of the zero-day exploit chain used against Google — from the malicious
+              lure to intranet exfiltration.
+            </p>
           </div>
-          <h1 className="text-2xl md:text-3xl font-semibold text-slate-100 tracking-tight">
-            CVE-2010-0249<span className="text-slate-500"> · IE DOM Use-After-Free</span>
-          </h1>
-          <p className="text-sm text-slate-400 max-w-md">
-            Animated, interactive reconstruction of the zero-day exploit chain used against Google — from the malicious
-            lure to intranet exfiltration.
-          </p>
-        </div>
-        <div className={`${severityClass} px-3 py-1.5 rounded-full text-xs font-bold border flex items-center gap-2`}>
-          <span className="w-2 h-2 rounded-full bg-current animate-pulse"></span>
-          {currentPhase.title}
-        </div>
-      </header>
+          <div className={`${severityClass} px-3 py-1.5 rounded-full text-xs font-bold border flex items-center gap-2`}>
+            <span className="w-2 h-2 rounded-full bg-current animate-pulse"></span>
+            {currentPhase.title}
+          </div>
+        </header>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Diagram column */}
@@ -639,8 +683,22 @@ export default function AuroraVisualizer() {
             onTouchStart={onTouchStart}
             onTouchMove={onTouchMove}
             onTouchEnd={onTouchEnd}
-            style={{ touchAction: "none" }}
+            style={{ touchAction: "none", ...wrapStyle }}
           >
+            {/* Fullscreen exit control (CSS fallback mode) - top-right of the map */}
+            {fullscreen && !document.fullscreenElement && (
+              <div className="absolute top-3 right-3 z-60">
+                <button
+                  onClick={() => setFullscreen(false)}
+                  className="p-2 rounded bg-black/60 backdrop-blur text-white hover:bg-black/80 transition-colors"
+                  aria-label="Exit fullscreen"
+                  title="Exit fullscreen"
+                >
+                  <Minimize className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+
             <svg
               ref={svgRef}
               viewBox={`0 0 ${CONTENT_W} ${CONTENT_H}`}
@@ -841,74 +899,78 @@ export default function AuroraVisualizer() {
         </div>
 
         {/* Detail column */}
-        <div className="lg:col-span-5 flex flex-col gap-4">
-          <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm">
-            <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider mb-3">
-              What happened
-            </h2>
-            <p className="text-sm text-slate-300 leading-relaxed mb-4">{currentPhase.body}</p>
-            <div className="bg-black/30 rounded-lg p-3.5 border border-slate-800/50 mb-4">
-              <p className="text-xs font-semibold text-slate-400 uppercase mb-1.5">Technical detail</p>
-              <p className="text-sm text-slate-200 leading-relaxed">{currentPhase.tech}</p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {currentPhase.tags.map((tag) => (
-                <span
-                  key={tag}
-                  className="px-2.5 py-1 rounded text-[10px] font-mono border bg-slate-800/60 text-slate-300 border-slate-700"
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
-            {(currentPhase.cve || currentPhase.cwe || currentPhase.cvss) && (
-              <div className="mt-4 flex flex-wrap gap-2">
-                {currentPhase.cve && (
-                  <span className="px-2.5 py-1 rounded text-[10px] font-bold border bg-red-500/10 text-red-400 border-red-500/30">
-                    {currentPhase.cve}
-                  </span>
-                )}
-                {currentPhase.cwe && (
-                  <span className="px-2.5 py-1 rounded text-[10px] font-bold border bg-amber-500/10 text-amber-400 border-amber-500/30">
-                    {currentPhase.cwe}
-                  </span>
-                )}
-                {currentPhase.cvss && (
-                  <span className="px-2.5 py-1 rounded text-[10px] font-bold border bg-red-600/20 text-red-400 border-red-500">
-                    CVSS {currentPhase.cvss} HIGH
-                  </span>
-                )}
+        {!fullscreen && (
+          <div className="lg:col-span-5 flex flex-col gap-4">
+            <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm">
+              <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider mb-3">
+                What happened
+              </h2>
+              <p className="text-sm text-slate-300 leading-relaxed mb-4">{currentPhase.body}</p>
+              <div className="bg-black/30 rounded-lg p-3.5 border border-slate-800/50 mb-4">
+                <p className="text-xs font-semibold text-slate-400 uppercase mb-1.5">Technical detail</p>
+                <p className="text-sm text-slate-200 leading-relaxed">{currentPhase.tech}</p>
               </div>
-            )}
-          </section>
+              <div className="flex flex-wrap gap-2">
+                {currentPhase.tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="px-2.5 py-1 rounded text-[10px] font-mono border bg-slate-800/60 text-slate-300 border-slate-700"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
+              {(currentPhase.cve || currentPhase.cwe || currentPhase.cvss) && (
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {currentPhase.cve && (
+                    <span className="px-2.5 py-1 rounded text-[10px] font-bold border bg-red-500/10 text-red-400 border-red-500/30">
+                      {currentPhase.cve}
+                    </span>
+                  )}
+                  {currentPhase.cwe && (
+                    <span className="px-2.5 py-1 rounded text-[10px] font-bold border bg-amber-500/10 text-amber-400 border-amber-500/30">
+                      {currentPhase.cwe}
+                    </span>
+                  )}
+                  {currentPhase.cvss && (
+                    <span className="px-2.5 py-1 rounded text-[10px] font-bold border bg-red-600/20 text-red-400 border-red-500">
+                      CVSS {currentPhase.cvss} HIGH
+                    </span>
+                  )}
+                </div>
+              )}
+            </section>
 
-          <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm flex-1">
-            <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider mb-3">
-              Node inspector
-            </h2>
-            <p className="text-xs text-slate-500 mb-3">Tap or hover any node in the map to inspect it.</p>
-            {tooltip.id ? (
-              <>
-                <h3 className="text-xs font-bold text-slate-200 mb-1 capitalize">{tooltip.id}</h3>
-                <p className="text-sm text-slate-300 leading-relaxed">{nodeContent[tooltip.id]?.detail}</p>
-              </>
-            ) : (
-              <p className="text-sm text-slate-400 italic">No node selected.</p>
-            )}
-          </section>
-        </div>
+            <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm flex-1">
+              <h2 className="text-sm font-semibold text-slate-200 uppercase tracking-wider mb-3">
+                Node inspector
+              </h2>
+              <p className="text-xs text-slate-500 mb-3">Tap or hover any node in the map to inspect it.</p>
+              {tooltip.id ? (
+                <>
+                  <h3 className="text-xs font-bold text-slate-200 mb-1 capitalize">{tooltip.id}</h3>
+                  <p className="text-sm text-slate-300 leading-relaxed">{nodeContent[tooltip.id]?.detail}</p>
+                </>
+              ) : (
+                <p className="text-sm text-slate-400 italic">No node selected.</p>
+              )}
+            </section>
+          </div>
+        )}
       </div>
 
-      {/* Footer */}
-      <footer className="mt-10 border-t border-slate-800/60 pt-6 flex flex-col md:flex-row justify-between gap-4 text-xs text-slate-500">
-        <div className="flex items-center gap-2">
-          CVE-2010-0249 · CWE-416 Use-After-Free · MSHTML (Internet Explorer) · Patched by MS10-002, January 21, 2010
-        </div>
-        <div className="flex items-center gap-3">
-          <span>Operation Aurora — December 2009 / January 2010 — Google and 30+ other firms</span>
-          <span className="border-l border-slate-700 pl-3">Defense: patch · DEP · sandbox · ASLR · heap hardening</span>
-        </div>
-      </footer>
+      {/* Footer - hidden when in CSS fullscreen fallback */}
+      {!fullscreen && (
+        <footer className="mt-10 border-t border-slate-800/60 pt-6 flex flex-col md:flex-row justify-between gap-4 text-xs text-slate-500">
+          <div className="flex items-center gap-2">
+            CVE-2010-0249 · CWE-416 Use-After-Free · MSHTML (Internet Explorer) · Patched by MS10-002, January 21, 2010
+          </div>
+          <div className="flex items-center gap-3">
+            <span>Operation Aurora — December 2009 / January 2010 — Google and 30+ other firms</span>
+            <span className="border-l border-slate-700 pl-3">Defense: patch · DEP · sandbox · ASLR · heap hardening</span>
+          </div>
+        </footer>
+      )}
     </div>
   );
 
