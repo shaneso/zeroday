@@ -322,6 +322,7 @@ interface TooltipState {
 
 export default function AuroraVisualizer() {
   const diagramWrapRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const [phase, setPhase] = useState(0);
   const [playing, setPlaying] = useState(true);
   const [tooltip, setTooltip] = useState<TooltipState>({ id: null, x: 0, y: 0 });
@@ -418,7 +419,10 @@ export default function AuroraVisualizer() {
     const el = diagramWrapRef.current;
     if (!el) return;
     if (!document.fullscreenElement) {
-      el.requestFullscreen().catch(() => {});
+      el.requestFullscreen().catch(() => {
+        // Mobile browsers often block fullscreen; fall back to expanding in place.
+        setFullscreen(true);
+      });
     } else {
       document.exitFullscreen();
     }
@@ -434,6 +438,7 @@ export default function AuroraVisualizer() {
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
       if ((e.target as Element)?.closest("[data-node]")) return; // let the node handle taps
+      e.preventDefault();
       if (e.touches.length === 1) {
         const t = e.touches[0];
         setIsPanning(true);
@@ -451,13 +456,13 @@ export default function AuroraVisualizer() {
 
   const onTouchMove = useCallback(
     (e: React.TouchEvent) => {
-      e.preventDefault();
+      e.preventDefault(); // prevent scroll / browser zoom
       const { cssScale } = getViewport();
       if (e.touches.length === 1 && panStart.current) {
         const t = e.touches[0];
         const start = panStart.current;
-        const dx = (t.clientX - start.x) / (scaleRef.current * cssScale);
-        const dy = (t.clientY - start.y) / (scaleRef.current * cssScale);
+        const dx = (t.clientX - start.x) / cssScale;
+        const dy = (t.clientY - start.y) / cssScale;
         setPan(clampPan({ x: start.panX + dx, y: start.panY + dy }));
       } else if (e.touches.length === 2 && touchStart.current) {
         const d = distBetween(e.touches[0], e.touches[1]);
@@ -496,6 +501,11 @@ export default function AuroraVisualizer() {
     },
     [pan.x, pan.y, scale, getViewport]
   );
+
+  // Reposition the hover preview when panned/zoomed.
+  useEffect(() => {
+    if (tooltip.id) showTooltip(tooltip.id);
+  }, [pan.x, pan.y, scale, showTooltip]);
 
   // Autoplay ticker
   useEffect(() => {
@@ -593,8 +603,8 @@ export default function AuroraVisualizer() {
     },
   };
 
-  const { cssScale } = getViewport();
-  const transform = `translate(${pan.x * cssScale}px, ${pan.y * cssScale}px) scale(${scale})`;
+  // Single transform source of truth: SVG attribute (works on mobile WebKit).
+  const transform = `translate(${pan.x} ${pan.y}) scale(${scale})`;
 
   return (
     <div className="relative w-full max-w-7xl mx-auto px-4 py-6">
@@ -632,6 +642,7 @@ export default function AuroraVisualizer() {
             style={{ touchAction: "none" }}
           >
             <svg
+              ref={svgRef}
               viewBox={`0 0 ${CONTENT_W} ${CONTENT_H}`}
               className="w-full h-full block"
               preserveAspectRatio="xMidYMid meet"
@@ -667,7 +678,6 @@ export default function AuroraVisualizer() {
                 onMouseDown={(e: React.MouseEvent) => {
                   if (e.target !== e.currentTarget) return;
                   if (e.button !== 0) return;
-                  const { cssScale } = getViewport();
                   setIsPanning(true);
                   panStart.current = {
                     x: e.clientX,
@@ -690,8 +700,8 @@ export default function AuroraVisualizer() {
                 ))}
               </g>
 
-              {/* Pannable + zoomable content group (CSS transform) */}
-              <g style={{ transform, transformOrigin: "0 0" }}>
+              {/* Pannable + zoomable content group (SVG attribute transform) */}
+              <g transform={transform}>
                 {/* Edges drawn behind nodes */}
                 {edgesInPhase.map((edge) => (
                   <AnimatedEdge key={edge.id} edge={edge} nodes={nodesById} phase={phase} breached={breached} />
@@ -907,8 +917,8 @@ export default function AuroraVisualizer() {
     const start = panStart.current;
     if (!start) return;
     const { cssScale } = getViewport();
-    const dx = (e.clientX - start.x) / (scaleRef.current * cssScale);
-    const dy = (e.clientY - start.y) / (scaleRef.current * cssScale);
+    const dx = (e.clientX - start.x) / cssScale;
+    const dy = (e.clientY - start.y) / cssScale;
     setPan(clampPan({ x: start.panX + dx, y: start.panY + dy }));
   }
   function onPanEnd() {
